@@ -4,6 +4,8 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ApiManagementModels } from "azure-arm-apimanagement";
+import { OperationContract, OperationEntityBaseContract } from "azure-arm-apimanagement/lib/models";
+import { nonNullOrEmptyValue } from "../utils/nonNull";
 
 // tslint:disable-next-line:no-stateless-class
 export class Utils {
@@ -61,6 +63,46 @@ export class Utils {
             urlTemplate: cleanTemplate,
             parameters: parameters
         };
+    }
+
+    public static amendOperationNameAndPath(operation: OperationContract, existingOperations: OperationContract[]) : string {
+        let lastNumber = 0;
+        let operationName = nonNullOrEmptyValue(operation.name);
+
+        existingOperations.forEach(existing => {
+            const existingOperationName = nonNullOrEmptyValue(existing.name);
+            if (existingOperationName.toLowerCase() === operationName.toLowerCase()) {
+                lastNumber++;
+            }
+
+            const expression = `${this.escapeRegExp(operationName)}-(\\d{1,})`;
+            const regexp = new RegExp(expression, "g");
+            const matches = regexp.exec(existingOperationName);
+
+            if (matches && matches.length > 1) {
+                const lastNumberCandidate = parseInt(matches[1]);
+
+                if (lastNumberCandidate >= lastNumber) {
+                    lastNumber = lastNumberCandidate + 1;
+                }
+            }
+        });
+
+        if (lastNumber > 0) {
+            operationName = `${operation.name}-${lastNumber}`;
+            operation.displayName = `${operation.displayName}-${lastNumber}`;
+
+            // const parts = operation.id.split("/");
+            // operation.id = operation.id.replace(`/${parts[parts.length - 1]}`, `/${operation.name}`);
+
+            operation.urlTemplate = `${operation.urlTemplate}-${lastNumber}`;
+        }
+
+        return operationName;
+    }
+
+    private static escapeRegExp(str: string): string {
+        return str.replace(/[\-\[\]\/\{\}\(\)\*\+\?\.\\\^\$\|]/g, "\\$&");
     }
 
     private static removeAccents(str: string): string {

@@ -4,16 +4,16 @@
  *--------------------------------------------------------------------------------------------*/
 
 import { ApiManagementClient, ApiManagementModels } from "azure-arm-apimanagement";
-import { BackendCredentialsContract, PropertyContract, BackendContract } from "azure-arm-apimanagement/lib/models";
-import { Backend } from "azure-arm-apimanagement/lib/operations";
+import { BackendContract, BackendCredentialsContract, OperationContract, PolicyContract, PropertyContract } from "azure-arm-apimanagement/lib/models";
 import { WebSiteManagementClient, WebSiteManagementModels } from "azure-arm-website";
 import { FunctionEnvelope } from "azure-arm-website/lib/models";
 import { ServiceClientCredentials } from "ms-rest";
 import { WebResource } from "ms-rest";
 import * as request from 'request-promise';
 import { appendExtensionUserAgent } from "vscode-azureextensionui";
+import { localize } from "../localize";
 import { getNameFromId, getResourceGroupFromId } from "../utils/azure";
-import { nonNullValue } from "../utils/nonNull";
+import { nonNullOrEmptyValue, nonNullValue } from "../utils/nonNull";
 import { signRequest } from "../utils/signRequest";
 import { FunctionHost, FunctionKey, FunctionKeys } from "./Contracts";
 import { Utils } from "./Utils";
@@ -70,7 +70,6 @@ export class FunctionAppAsAPI {
             }
         }
 
-        const propertyNames = [];
         if (operations.length > 0) {
             let appPrefix = "/api";
 
@@ -109,25 +108,55 @@ export class FunctionAppAsAPI {
 
             const backendEntity = await this.setAppBackendEntity(funcAppId, appPath, apiId, backendCredentials);
 
-            await this.apiManagementClient.apiOperation.listByApi()
-
-            const checkOperations = await this.apiService.getOperations(apiId);
-            const existingOperations = checkOperations.value;
+            const existingOperations = await this.getApiOperations(apiId);
 
             for (let i = 0; i < operations.length; i++) {
                 const operation = operations[i];
 
+                let operationName = nonNullOrEmptyValue(operation.name);
                 if (existingOperations.length > 0) {
-                    Utils.amendOperationNameAndPath(operation, existingOperations);
+                    operationName = Utils.amendOperationNameAndPath(operation, existingOperations);
                 }
 
-                await this.apiService.createOperation(operation);
-
-                const requestPolicy = new RequestPolicy();
-                requestPolicy.inboundPolicy.setChildPolicy(Utils.setApimGeneratedPolicyId(new SetBackendServicePolicy(null, backendEntity.name)));
-                await this.policyService.setPolicyXmlForOperationScope(operation.id, requestPolicy.toXml());
+                await this.createOperation(apiId, operationName, operation);
+                await this.createOperationPolicy(apiId, operationName, backendEntity);
             }
         }
+    }
+
+    private async createOperationPolicy(apiId: string, operationName: string, backendEntity: BackendContract) : Promise<void> {
+        const resourceGroupName = getResourceGroupFromId(apiId);
+        const serviceName = getNameFromId(apiId);
+        const apiName = this.getApiName(apiId);
+
+        const policy: PolicyContract = {
+        format: "rawxml",
+        value: `<policies>
+        <inbound>
+            <base />
+            <set-backend-service id="apim-generated-policy" backend-id="${backendEntity.name}" />
+        </inbound>
+        <backend>
+            <base />
+        </backend>
+        <outbound>
+            <base />
+        </outbound>
+        <on-error>
+            <base />
+        </on-error>
+    </policies>`
+};
+
+        await this.apiManagementClient.apiOperationPolicy.createOrUpdate(resourceGroupName, serviceName, apiName, operationName, policy);
+    }
+
+    private async createOperation(apiId: string, operationName: string, operation: OperationContract) : Promise<void> {
+        const resourceGroupName = getResourceGroupFromId(apiId);
+        const serviceName = getNameFromId(apiId);
+        const apiName = this.getApiName(apiId);
+
+        await this.apiManagementClient.apiOperation.createOrUpdate(resourceGroupName, serviceName, apiName, operationName,  operation);
     }
 
     private async setAppBackendEntity(appId: string, appPath: string, apiId: string, credentials?: BackendCredentialsContract): Promise<BackendContract> {
@@ -235,6 +264,23 @@ export class FunctionAppAsAPI {
         return functions;
     }
 
+    private async getApiOperations(apiId: string): Promise<OperationContract[]> {
+        const resourceGroupName = getResourceGroupFromId(apiId);
+        const serviceName = getNameFromId(apiId);
+        const apiName = this.getApiName(apiId);
+
+        let operations: OperationContract[] = [];
+        let nextLink: string | undefined;
+        do {
+            const ops: ApiManagementModels.OperationCollection = nextLink ? await this.apiManagementClient.apiOperation.listByApi(resourceGroupName, serviceName, apiName) : await this.apiManagementClient.apiOperation.listByApiNext(nonNullValue(nextLink));
+            nextLink = ops.nextLink;
+            operations = operations.concat(...ops);
+
+        } while (nextLink !== undefined);
+
+        return operations;
+    }
+
     private async getFuncAppToken(functionAppId: string): Promise<string> {
         const resourceGroupName = getResourceGroupFromId(functionAppId);
         const functionAppName = getNameFromId(functionAppId);
@@ -254,15 +300,14 @@ export class FunctionAppAsAPI {
         };
     }
 
-    private getApiName(apiId: string): string | undefined {
+    private getApiName(apiId: string): string {
         const nameRegex = /apis\/([^/]+)/;
         const nameMatches = nameRegex.exec(apiId);
 
         if (nameMatches && nameMatches.length > 1) {
-            const name = nameMatches[1];
-            return name;
+            return nameMatches[1];
         } else {
-            return undefined;
+            throw new Error(localize("missingAPIName", "Cannot retrieve API name from Id."));
         }
     }
 }
