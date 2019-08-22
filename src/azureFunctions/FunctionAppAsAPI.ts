@@ -3,19 +3,24 @@
  *  Licensed under the MIT License. See License.md in the project root for license information.
  *--------------------------------------------------------------------------------------------*/
 
-import { WebSiteManagementClient, WebSiteManagementModels } from "azure-arm-website";
 import { ApiManagementClient, ApiManagementModels } from "azure-arm-apimanagement";
-import { ServiceClientCredentials } from "ms-rest";
-import { getResourceGroupFromId, getNameFromId } from "../utils/azure";
+import { WebSiteManagementClient, WebSiteManagementModels } from "azure-arm-website";
 import { FunctionEnvelope } from "azure-arm-website/lib/models";
-import { nonNullValue, nonNullProp } from "../utils/nonNull";
+import { ServiceClientCredentials } from "ms-rest";
+import { WebResource } from "ms-rest";
+import * as request from 'request-promise';
+import { appendExtensionUserAgent } from "vscode-azureextensionui";
+import { getNameFromId, getResourceGroupFromId } from "../utils/azure";
+import { nonNullValue } from "../utils/nonNull";
+import { signRequest } from "../utils/signRequest";
+import { PropertyContract, BackendCredentialsContract } from "azure-arm-apimanagement/lib/models";
 
 export class FunctionAppAsAPI {
     private readonly _webSiteClient: WebSiteManagementClient;
     private readonly _apiManagementClient: ApiManagementClient;
 
     constructor(
-        credentials: ServiceClientCredentials,
+        public readonly credentials: ServiceClientCredentials,
         subscriptionId: string) {
         this._webSiteClient = new WebSiteManagementClient(credentials, subscriptionId);
         this._apiManagementClient = new ApiManagementClient(credentials, subscriptionId);
@@ -140,7 +145,7 @@ export class FunctionAppAsAPI {
         return "";
     }
 
-    public async importFunctionApp(funcAppId: string, funcAppName: string, funcAppTriggers: string[], apiId: string) : Promise<void> {
+    public async importFunctionApp(funcAppId: string, funcAppName: string, funcAppTriggers: string[], apiId: string, runtimeHost: string): Promise<void> {
         if (funcAppTriggers === undefined || funcAppTriggers.length === 0) {
             return undefined;
         }
@@ -160,6 +165,7 @@ export class FunctionAppAsAPI {
                 const binding = triggerConfig.config.bindings.find(b => !b.direction || b.direction === "in");
                 const route = `/${binding.route || trigger}`;
 
+                // tslint:disable: no-unsafe-any
                 if (binding.methods && binding.methods.length > 0) {
                     binding.methods.forEach(method => {
                         const operation = this.getNewOperation(apiId, method, FunctionAppAsAPI.displayNameToIdentifier(`${method}-${trigger}`), trigger);
@@ -178,9 +184,155 @@ export class FunctionAppAsAPI {
 
             }
         }
+
+        const propertyNames = [];
+        if (operations.length > 0) {
+            let appPrefix = "/api";
+
+            const token = await this.getFuncAppToken(funcAppId);
+
+            const funcAppToken = `Bearer ${token}`;
+            const funcKey = await this.addFuncHostKey(apiId, runtimeHost, funcAppToken);
+
+            if (functionConfigUrl) {
+                const hostConfig = await this.getFuncAppHostConfig(functionConfigUrl);
+                if (!hostConfig || !hostConfig.http || hostConfig.http.routePrefix === undefined) {
+                    appPrefix = "/api";
+                } else {
+                    appPrefix = hostConfig.http.routePrefix === "" ? "" : `/${hostConfig.http.routePrefix}`;
+                }
+            }
+            const appPath = `https://${runtimeHost}${appPrefix}`;
+            const propertyId = FunctionAppAsAPI.displayNameToIdentifier(`${funcAppName}-key`);
+
+            const serviceResourceGroupName = getResourceGroupFromId(apiId);
+            const serviceName = getNameFromId(apiId);
+
+            const securityProperty: PropertyContract = {
+                displayName: propertyId,
+                value: funcKey,
+                tags: ["key", "function", "auto"],
+                secret: true
+            };
+
+            await this._apiManagementClient.property.createOrUpdate(serviceResourceGroupName, serviceName, propertyId, securityProperty);
+
+            const backendCredentials: BackendCredentialsContract  = {
+                // tslint:disable-next-line:object-literal-key-quotes
+                query: { "code": [`{{${securityProperty.name}}}`] }
+            };
+
+            const backendEntity = await this.setAppBackendEntity(funcAppId, appPath, null, backendCredentials);
+            const checkOperations = await this.apiService.getOperations(apiId);
+            const existingOperations = checkOperations.value;
+
+            for (let i = 0; i < operations.length; i++) {
+                const operation = operations[i];
+
+                if (existingOperations.length > 0) {
+                    Utils.amendOperationNameAndPath(operation, existingOperations);
+                }
+
+                await this.apiService.createOperation(operation);
+
+                const requestPolicy = new RequestPolicy();
+                requestPolicy.inboundPolicy.setChildPolicy(Utils.setApimGeneratedPolicyId(new SetBackendServicePolicy(null, backendEntity.name)));
+                await this.policyService.setPolicyXmlForOperationScope(operation.id, requestPolicy.toXml());
+            }
+        }
     }
 
-    private async getFuncAppFunctions(functionAppId: string) : Promise<FunctionEnvelope[]> {
+    private async setAppBackendEntity(appId: string, appPath: string, appType?: Constants.AzureResourceType, credentials?: BackendCredentials): Promise<Backend> {
+        const appName = this.getApiAppName(appId);
+        const id = appType ? `${appType}_${Utils.displayNameToIdentifier(appName)}` : Utils.displayNameToIdentifier(appName);
+        const backendEntity: Backend = {
+            id: id,
+            name: id,
+            properties: {
+                description: `${appName}`,
+                url: appPath,
+                protocol: "http",
+                resourceId: `${this.armEndpoint}${appId}`,
+                credentials: credentials
+            }
+        };
+        await this.policyService.setBackendEntity(backendEntity);
+
+        return backendEntity;
+    }
+
+    public async getFuncAppHostConfig(functionConfigUrl: string): Promise<FunctionHost> {
+        let hostConfigUrl: string;
+        const parts = functionConfigUrl.split("/functions/");
+        if (parts.length === 2) {
+            parts[1] = "config";
+            hostConfigUrl = parts.join("/functions/");
+        } else {
+            throw new Error(`Unexpected function config url: ${functionConfigUrl}`);
+        }
+
+        const requestOptions: WebResource = new WebResource();
+        requestOptions.headers = {
+            ['User-Agent']: appendExtensionUserAgent(),
+        };
+        requestOptions.method = "GET";
+        requestOptions.url = hostConfigUrl;
+
+        await signRequest(requestOptions, this.credentials);
+
+        // tslint:disable-next-line: await-promise
+        const response = await request(requestOptions).promise();
+
+        return JSON.parse(<string>(response));
+    }
+
+    private async addFuncHostKey(apiId: string, runtimeHost: string, funcAppToken: string): Promise<string> {
+        const hostKeys = await this.getFuncHostKeys(runtimeHost, funcAppToken);
+        const funcAppKeyName = await this.getServiceFuncKeyName(apiId);
+        const existKey = hostKeys.keys.find(key => key.name === funcAppKeyName);
+        if (existKey) {
+            return existKey.value;
+        }
+
+        const newFuncKey = await this.createFuncHostKey(runtimeHost, funcAppKeyName, funcAppToken);
+
+        return newFuncKey.value;
+    }
+
+    private async getServiceFuncKeyName(apiId: string): Promise<string> {
+        const serviceName = getNameFromId(apiId);
+        return `apim-${serviceName}`;
+    }
+
+    private async getFuncHostKeys(runtimeHost: string, funcAppToken: string): Promise<FunctionKeys> {
+        const requestOptions: WebResource = new WebResource();
+        requestOptions.headers = {
+            ['User-Agent']: appendExtensionUserAgent(),
+            ['Authorization']: funcAppToken
+        };
+        requestOptions.method = "GET";
+        requestOptions.url = `https://${runtimeHost}/admin/host/keys`;
+        // tslint:disable-next-line: await-promise
+        const response = await request(requestOptions).promise();
+
+        return JSON.parse(<string>(response));
+    }
+
+    private async createFuncHostKey(runtimeHost: string, funcKeyName: string, funcAppToken: string): Promise<FunctionKey> {
+        const requestOptions: WebResource = new WebResource();
+        requestOptions.headers = {
+            ['User-Agent']: appendExtensionUserAgent(),
+            ['Authorization']: funcAppToken
+        };
+        requestOptions.method = "POST";
+        requestOptions.url = `https://${runtimeHost}/admin/host/keys/${funcKeyName}`;
+        // tslint:disable-next-line: await-promise
+        const response = await request(requestOptions).promise();
+
+        return JSON.parse(<string>(response));
+    }
+
+    private async getFuncAppFunctions(functionAppId: string): Promise<FunctionEnvelope[]> {
         const resourceGroupName = getResourceGroupFromId(functionAppId);
         const functionAppName = getNameFromId(functionAppId);
 
@@ -204,13 +356,44 @@ export class FunctionAppAsAPI {
 
     private getNewOperation(apiId: string, method: string, operationId = FunctionAppAsAPI.getBsonObjectId(), displayName: string | undefined): ApiManagementModels.OperationContract {
         return {
-            id : `${apiId}/operations/${operationId}`,
-            name : operationId,
-            displayName : displayName || operationId,
-            method : method,
-            description : "",
-            urlTemplate : "*",
-            templateParameters : []
+            id: `${apiId}/operations/${operationId}`,
+            name: operationId,
+            displayName: displayName || operationId,
+            method: method,
+            description: "",
+            urlTemplate: "*",
+            templateParameters: []
         };
     }
+}
+
+// tslint:disable:interface-name
+export interface FunctionKeys {
+    keys: Key[];
+    links: Link[];
+}
+
+export interface Link {
+    rel: string;
+    href: string;
+}
+
+export interface Key {
+    name: string;
+    value: string;
+}
+
+export interface FunctionKey {
+    name: string;
+    value: string;
+    links: Link[];
+}
+
+export interface FunctionHost {
+    http: {
+        routePrefix: string;
+        maxOutstandingRequests: number;
+        maxConcurrentRequests: number;
+        dynamicThrottlesEnabled: boolean;
+    };
 }
