@@ -30,7 +30,7 @@ export class FunctionAppAsAPI {
         this.apiManagementClient = new ApiManagementClient(credentials, subscriptionId);
     }
 
-    public async importFunctionApp(funcAppId: string, funcAppName: string, funcAppTriggers: string[], apiId: string, runtimeHost: string): Promise<void> {
+    public async importFunctionApp(apiId: string, funcAppId: string, funcAppName: string, funcAppTriggers: string[], runtimeHost: string): Promise<void> {
         if (funcAppTriggers === undefined || funcAppTriggers.length === 0) {
             return undefined;
         }
